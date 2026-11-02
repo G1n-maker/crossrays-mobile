@@ -1,0 +1,37 @@
+# ---- 游戏文件与密钥（绝不入库）----
+*.xci
+*.nsp
+*.nsz
+*.xcz
+prod.keys
+title.keys
+*.keys
+keys/*.keys
+Game/
+SD Gundam*
+
+# ---- 构建产物 ----
+work/
+nxnative/
+.tools/
+.venv/
+*.ipa
+*.app
+*.xcarchive
+xcode-derived-data/
+xcode-out/
+
+# ---- 日志与临时 ----
+logs_*.txt
+logs/
+*.log
+tmp/
+
+# ---- 系统与编辑器 ----
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+*.xcworkspace/
+keys/

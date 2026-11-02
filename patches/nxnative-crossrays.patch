@@ -1,0 +1,200 @@
+diff --git a/dm/games/game.py b/dm/games/game.py
+index 6089fe9..958d963 100644
+--- a/dm/games/game.py
++++ b/dm/games/game.py
+@@ -95,6 +95,8 @@ def header(g):
+     vers = ', '.join('{' + q(b['main']) + ', ' + q(b['display']) + '}' for b in g.builds().values() if 'main' in b)
+     pi = g.get('present_interval', 'game')   # present interval: game = as the game sets it (as on the Switch), display = one frame per display tick
+     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
++    pf = g.get('present_fill', '')   # how the picture fills a screen whose ratio differs from the game's (nvn_mtl.m present_viewport): '' = letterbox, crop = scale to the width and cut the excess height, stretch = distort
++    if pf not in ('', 'crop', 'stretch'): sys.exit(f'{g.id}: present_fill must be empty (letterbox), crop or stretch: {pf}')
+     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
+     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
+@@ -169,6 +171,7 @@ def header(g):
+          f'#define DM_GAME_STDALLOC_CAP {int(g.get("stdalloc_cap", "0"), 0):#x}ull',   # StandardAllocator's address space with virtual address memory (hle_svc.c); 0 = what the alias region has room for
+          f'#define DM_GAME_DISPLAY_VERSIONS {vers}',
+          f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
++         f'#define DM_GAME_PRESENT_FILL {q(pf)}',
+          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
+          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
+          f'#define DM_GAME_FPS_TARGET {int(ft)}',
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+index 00e1ddd..e588105 100644
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -18,6 +18,7 @@ DM_FPS_TARGET	choice	30=30 fps,60=60 fps	DM_GAME_FPS_TARGET	DM_GAME_FPS_TARGET!=
+ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Adjusts resolution between 70% and 100% under load. Turn off to keep full resolution for the selected console mode.
+ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
+ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
++DM_PRESENT_FILL	choice	=Letterbox,crop=Fill screen,stretch=Stretch	DM_GAME_PRESENT_FILL	platform:ios	Game	Screen fill	Letterbox keeps every pixel as the game drew it. Fill scales to the screen's width and cuts 9% off the top and bottom, which keeps shapes correct. Stretch distorts.	level=basic
+ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+ DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 86b8eff..0ace619 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -2481,7 +2481,11 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
+ }
+ static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
+     if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
+-    if (t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
++    // COMPRESSIBLE is a Switch memory-compression hint, not a data format: the game still writes plain texels into the
++    // pool. The host never implements pool compression, so skipping the fill on this flag left every texture of a game
++    // that sets it on all of them (SD GUNDAM G GENERATION CROSS RAYS, SDK 9.4.1) with content 0 — the whole screen black
++    // but for text. Kept out of the way only for the real exclusions below (multisampled, depth formats).
++    if (t->d.samples > 1 || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
+     int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0, uncached = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) != 0;
+     static int flush_fill = -1; if (flush_fill < 0) { const char *e = getenv("DM_NVN_FLUSH_FILL"); flush_fill = !e || atoi(e) != 0; }
+     if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
+@@ -11460,8 +11464,15 @@ static void present_pipeline(MTLPixelFormat format) {
+ // The rectangle of the canvas (dw x dh) the picture (cw x ch) is drawn into: the picture's aspect ratio kept and centred, black bars in the rest (no stretching when the screen's ratio
+ // differs from the game's, e.g. iPhone about 19.5:9 against the game's 16:9); when the ratios differ by under 1 % (the remainder from a game width that is a multiple of 8 in the
+ // full-screen setup, e.g. 1952x900 against 2868x1320 differs by 0.17 %) the whole canvas, leaving no border of a few pixels
++//
++// FILL: a phone screen is wider than a 16:9 game (iPhone 16 Pro 2622x1206, 2.174 against 1.778), so filling it means either stretching the picture 22% sideways or throwing
++// away the top and bottom. DM_PRESENT_FILL=crop scales to the canvas width and lets the excess height fall outside the viewport (a 16:9 game loses 9% of its height at each edge,
++// 98 px of the original 1080), which keeps every pixel's shape — the quality-preserving way to fill. DM_PRESENT_FILL=stretch maps the picture onto the whole canvas, which
++// distorts it. Unset keeps the bars: the picture as the game drew it, complete and undistorted.
+ static MTLViewport present_viewport(double cw, double ch, double dw, double dh) {
+-    double s = fmin(dw / cw, dh / ch);
++    static int fill = -1; if (fill < 0) { const char *e = getenv("DM_PRESENT_FILL"); if (!e || !*e) e = DM_GAME_PRESENT_FILL; fill = !e || !*e ? 0 : !strcmp(e, "crop") ? 1 : !strcmp(e, "stretch") ? 2 : 0; MLOG("present fill mode %d (env %s / profile \"%s\", picture %gx%g canvas %gx%g)", fill, getenv("DM_PRESENT_FILL") ? getenv("DM_PRESENT_FILL") : "(unset)", DM_GAME_PRESENT_FILL, cw, ch, dw, dh); }
++    if (fill == 2) return (MTLViewport){0, 0, dw, dh, 0, 1};
++    double s = fill == 1 ? fmax(dw / cw, dh / ch) : fmin(dw / cw, dh / ch);
+     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
+     if (fabs((dw / dh) / (cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
+     return vp;
+@@ -11487,6 +11498,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
+     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+     double dw = dst.width, dh = dst.height;
+     MTLViewport vp = present_viewport(cw, ch, dw, dh);
++    { static double lv[4]; if (memcmp(lv, &vp, sizeof lv)) { memcpy(lv, &vp, sizeof lv);
++        MLOG("present viewport now %.0f,%.0f %.0fx%.0f / canvas %.0fx%.0f (picture %lux%lu)", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)cw, (unsigned long)ch); } }
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
+     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
+@@ -11579,6 +11592,8 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+     present_pipeline(dst.pixelFormat);
+     double dw = dst.width, dh = dst.height;
+     MTLViewport vp = present_viewport(r[2], r[3], dw, dh);
++    { static double lv4[4]; if (memcmp(lv4, &vp, sizeof lv4)) { memcpy(lv4, &vp, sizeof lv4);
++        MLOG("present viewport (M4) %.0f,%.0f %.0fx%.0f / canvas %.0fx%.0f (picture %lux%lu)", vp.originX, vp.originY, vp.width, vp.height, dw, dh, (unsigned long)r[2], (unsigned long)r[3]); } }
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+     id<MTLTexture> tex = present_raw_src(src), up = fx ? fx_encode(fx, cb, tex, r, vp, dst.pixelFormat, fx == &g_fx_present) : nil;
+     if (up) { tex = up; r[0] = r[1] = 0; r[2] = up.width; r[3] = up.height; }   // the scaled picture, the viewport's size: drawn 1:1
+diff --git a/dm/host/front_mac.m b/dm/host/front_mac.m
+index 714987f..07ad130 100644
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -1184,6 +1184,10 @@ void front_run(void (*guest)(void)) {
+         [NSApplication sharedApplication];
+         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+         NSRect r = NSMakeRect(0, 0, 1280, 720);
++        {   // DM_WINDOW_SIZE=WxH: a canvas whose ratio differs from the game's, to exercise the present's fill modes on the Mac (an iPhone is about 2.17:1 against 16:9)
++            const char *ws = getenv("DM_WINDOW_SIZE"); unsigned w = 0, h = 0;
++            if (ws && sscanf(ws, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 240) r = NSMakeRect(0, 0, w, h);
++        }
+         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
+                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                       backing:NSBackingStoreBuffered defer:NO];
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 80a055b..dcb1eef 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -726,8 +726,7 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmou
+ 
+ // ---------- Files ----------
+ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
+-    int mi; int64_t k;
+-    if (img_path(path, &mi, &k)) {
++    int mi; int64_t k;    if (img_path(path, &mi, &k)) {
+         if (k < 0) return err_res("open", path);
+         if (!g_mnt[mi].img->e[k].type) return RES_PATH_NOT_FOUND;
+         if (mode & (MODE_WRITE | MODE_APPEND)) { LOG("fs write to a read-only mount: %s", path); return RES_FAIL; }
+@@ -1037,6 +1036,14 @@ HLE_FORCE("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", "fsp-srv → pread(2), mus
+ }
+ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", "fsp-srv → pread(2) (overload with read options, which the host ignores)", Result, h_fs_ReadFileOpt,
+           size_t *out, uint64_t h, int64_t off, void *buf, size_t sz, const void *opt) { (void)opt; return h_fs_ReadFile(out, h, off, buf, sz); }
++// ReadFile with neither the bytes-read output nor a ReadOption (SD GUNDAM G GENERATION CROSS RAYS, SDK 9.4.1: main's JUMP_SLOT at 0x156a460).
++// The SDK's own nn::fs::ReadFile in `sdk` dereferences the FileHandle as a FileAccessor pointer, and the host's handle is a synthesised
++// image-entry id (1<<58 | mount<<32 | index, shifted left by 4 for the guest), so without this hook the guest faulted at sdk+0x62a78
++// reading [x0 + 0x24] from 0x4000000000000390 while GetFileSize (hooked) had answered correctly. Same contract as its ReadOption twin.
++HLE_FORCE("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvmRKNS0_10ReadOptionE", "fsp-srv → pread(2) (overload with read options and no bytes-read output, which the host ignores)", Result, h_fs_ReadFileOpt2,
++          uint64_t h, int64_t off, void *buf, size_t sz, const void *opt) {
++    (void)opt; size_t got = 0; return h_fs_ReadFile(&got, h, off, buf, sz);
++}
+ HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv; directory entry count (filtered by the mode given at open, read position untouched)", Result, h_fs_DirCount, int64_t *out, uint64_t hh) {
+     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0;
+     if (h->snap) { for (int64_t i = 0; i < h->nsnap; i++) if (h->mode & (h->snap[i].type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE)) n++; *out = n; return RES_OK; }
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index a079d7f..dc67482 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -106,8 +106,8 @@ static void phone_motion_start(UIView *body) {
+ 
+ // ---- Layout constants (in u; x measured from the outer edge, the right half mirrors) ----
+ static const CGFloat
+-    K_ZL_X = 44, K_ZL_Y = 40, K_ZL_R = 26,          // ZL / ZR: centre from the outer edge and the top, radius
+-    K_L_X = 44, K_L_Y = 108, K_L_R = 24,            // L / R: same column as ZL / ZR
++    K_ZL_X = 30, K_ZL_Y = 36, K_ZL_R = 26,          // ZL / ZR: centre from the outer edge and the top, radius
++    K_L_X = 30, K_L_Y = 100, K_L_R = 24,            // L / R: same column as ZL / ZR
+     K_DROP_TIP = 1.45,                              // teardrop tip distance from the centre (times the radius)
+     K_CORNER_IN = 0.5,                              // how far the bottom-corner controls reach into the side safe-area inset (in landscape there is only the rounded screen corner there; the Dynamic Island is mid-edge)
+     K_FACE_X = 81, K_PAD_Y = 82,                    // diamond centre from the outer edge; diamond and stick centre from the bottom (B's lower edge about 5 above it)
+@@ -124,7 +124,7 @@ static void phone_motion_start(UIView *body) {
+     K_DPAD_GRAB = 1.3,                              // D-pad grab radius (times the outer edge)
+     K_RSTICK_R = 60,                                // right stick (not drawn): radius around its centre, the touch-down point
+     K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
+-    K_CLICK_X = 102, K_CLICK_R = 17;                // L3 / R3: centre from the outer edge (level with ZL / ZR), radius
++    K_CLICK_X = 88, K_CLICK_R = 17;                 // L3 / R3: centre from the outer edge (level with ZL / ZR), radius
+ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
+ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+ int dm_opmode(void);   // hle_oe.c: 0 = handheld
+@@ -240,10 +240,10 @@ - (CGPoint)dpadCenter { CGRect s = self.corner; CGFloat u = self.u; return side(
+ - (CGFloat)dpadR { return K_DPAD_R * self.u; }
+ static BOOL isDrop(int b) { return b == B_ZL || b == B_L || b == B_ZR || b == B_R; }
+ static BOOL isClick(int b) { return b == B_LS || b == B_RS; }
+-- (CGPoint)dropCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; BOOL z = b == B_ZL || b == B_ZR;
++- (CGPoint)dropCenter:(int)b { CGRect s = self.corner; CGFloat u = self.u; BOOL z = b == B_ZL || b == B_ZR;   // corner, not safe: the shoulders reach halfway into the side inset like the bottom-corner controls, instead of standing a full inset in from the edge
+     return side(s, b == B_ZR || b == B_R, (z ? K_ZL_X : K_L_X) * u, CGRectGetMinY(s) + (z ? K_ZL_Y : K_L_Y) * u); }
+ - (CGFloat)dropR:(int)b { return (b == B_ZL || b == B_ZR ? K_ZL_R : K_L_R) * self.u; }
+-- (CGPoint)clickCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; return side(s, b == B_RS, K_CLICK_X * u, CGRectGetMinY(s) + K_ZL_Y * u); }
++- (CGPoint)clickCenter:(int)b { CGRect s = self.corner; CGFloat u = self.u; return side(s, b == B_RS, K_CLICK_X * u, CGRectGetMinY(s) + K_ZL_Y * u); }
+ - (CGRect)pillRect:(int)b { CGRect s = self.safe; CGFloat u = self.u, w = K_PILL_W * u, h = K_PILL_H * u;
+     CGPoint c = CGPointMake(CGRectGetMidX(s) + (b == B_PLUS ? K_PILL_DX : -K_PILL_DX) * u, CGRectGetMinY(s) + K_PILL_Y * u);   // − on the left, + on the right
+     return CGRectMake(c.x - w / 2, c.y - h / 2, w, h); }
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index b941e77..74bb473 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -56,6 +56,11 @@ static CGRect fit_16_9(CGRect b) {   // the largest centered 16:9 rectangle in b
+     if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
+     return CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+ }
++// DM_PRESENT_FILL (crop / stretch) fills the screen instead: the layer gets the phone's whole bounds, so the picture reaches
++// the edges and the present's own viewport decides what is shown (nvn_mtl.m present_viewport). Empty: the largest centred 16:9
++// rectangle, with the phone's screen showing black outside it.
++static BOOL present_fill_on(void) { const char *e = getenv("DM_PRESENT_FILL"); return e && *e; }
++static CGRect game_rect(CGRect b) { return present_fill_on() ? b : fit_16_9(b); }
+ static void tv_attach(void);
+ 
+ @interface DmRootVC : UIViewController
+@@ -117,7 +122,7 @@ - (void)startGame {
+ - (void)viewDidLayoutSubviews {
+     [super viewDidLayoutSubviews];
+     CGRect b = self.view.bounds; if (!self.game) return;
+-    if (self.game.superview == self.view) self.game.frame = fit_16_9(b);   // on a TV the TV's view lays it out
++    if (self.game.superview == self.view) self.game.frame = game_rect(b);   // on a TV the TV's view lays it out
+     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
+         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+@@ -147,7 +152,7 @@ @interface DmTVVC : UIViewController
+ @end
+ @implementation DmTVVC
+ - (void)viewDidLoad { [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor; }
+-- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; for (UIView *v in self.view.subviews) v.frame = fit_16_9(self.view.bounds); }
++- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; for (UIView *v in self.view.subviews) v.frame = game_rect(self.view.bounds); }
+ @end
+ static UIWindow *g_tv; static int g_tv_mode_was = -1;
+ static void tv_attach(void) {
