@@ -6,6 +6,10 @@ Horizon 系统服务由 Host 顶替，NVN 图形 API 重建在 Metal 上。
 
 **自带游戏文件**（Bring your own game）：这个仓库不含任何游戏内容。
 
+<p align="center">
+  <img src="docs/images/title.jpg" width="100%" alt="The title screen: two Gundams clashing, fully rendered">
+</p>
+
 ---
 
 ## 状态
@@ -63,7 +67,10 @@ Horizon 系统服务由 Host 顶替，NVN 图形 API 重建在 Metal 上。
 | 2 | 卡在 `nnMain` 早期（`sdk+0x62a78`） | `nn::fs::ReadFile` 有一个重载没 hook，调用落到 SDK 实现解引用假 handle | 任何 SDK 9+ 且用这个签名的游戏 |
 | 3 | **全黑但有文字** | `NVN_TEXTURE_FLAGS_COMPRESSIBLE`(0x8) 让 `tex_init_fill` 跳过所有纹理上传 | ★ **任何给所有纹理设此标志 + 用 `SetStorage` 写内存的游戏** |
 
-第 3 条是**通用 bug**，不只修了 Cross Rays。
+第 3 条是**通用 bug**，不只修了 Cross Rays。前两条已经作为独立 PR 提给上游：
+
+- [seedds/nxnative#946](https://github.com/seedds/nxnative/pull/946) — `COMPRESSIBLE` 的填充条件
+- [seedds/nxnative#947](https://github.com/seedds/nxnative/pull/947) — `fs::ReadFile` 缺的 ReadOption 重载
 
 ### 两个体验优化
 
