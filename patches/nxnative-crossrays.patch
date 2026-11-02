@@ -31,24 +31,45 @@ index 00e1ddd..e588105 100644
  DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
  DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
  DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index a8b29fc..e50286c 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -369,8 +369,11 @@ typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; con
+ static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
+ static void ft_add(const tex_t *t) {
+     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
++    // COMPRESSIBLE is a memory-compression hint, not a data format: a game that sets it on every texture it creates (SD GUNDAM G GENERATION CROSS RAYS,
++    // SDK 9.4.1) still writes plain texels, so those textures must be registered too or the CPU writes that follow stay invisible (its tutorial overlay's
++    // background never appeared). A CPU_NO_ACCESS pool keeps the exclusion: there the compression tags may really be there.
+     if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+-        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE))) return;
++        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
+     pthread_mutex_lock(&g_ft_mu);
+     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
+     uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
 diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
-index 86b8eff..0ace619 100644
+index 86b8eff..026bede 100644
 --- a/dm/gfx/nvn/nvn_mtl.m
 +++ b/dm/gfx/nvn/nvn_mtl.m
-@@ -2481,7 +2481,11 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
+@@ -2481,8 +2481,15 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
  }
  static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
      if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
 -    if (t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
-+    // COMPRESSIBLE is a Switch memory-compression hint, not a data format: the game still writes plain texels into the
-+    // pool. The host never implements pool compression, so skipping the fill on this flag left every texture of a game
-+    // that sets it on all of them (SD GUNDAM G GENERATION CROSS RAYS, SDK 9.4.1) with content 0 — the whole screen black
-+    // but for text. Kept out of the way only for the real exclusions below (multisampled, depth formats).
++    // COMPRESSIBLE is a Switch memory-compression hint, not a data format. In a CPU_NO_ACCESS pool the game never writes
++    // the storage, so the compression tags may really be there and the memory means nothing without them (Rhythm Heaven
++    // Groove's render targets). In a pool the CPU writes (CPU_UNCACHED) the texels are plain: SD GUNDAM G GENERATION CROSS
++    // RAYS (SDK 9.4.1) sets COMPRESSIBLE on every texture it creates in 0xa2 pools and writes ordinary texels into them, so
++    // skipping the fill left all of them with content 0 — the screen black but for text, `packaged textures: first
++    // uploads 0`. The check below therefore runs after the pool is known.
 +    if (t->d.samples > 1 || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
      int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0, uncached = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) != 0;
++    if (no_cpu && (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;   // a pool the CPU cannot write: see above
      static int flush_fill = -1; if (flush_fill < 0) { const char *e = getenv("DM_NVN_FLUSH_FILL"); flush_fill = !e || atoi(e) != 0; }
      if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
-@@ -11460,8 +11464,15 @@ static void present_pipeline(MTLPixelFormat format) {
+     if (!atomic_load(&g_sub_thread_set) || !on_sub_thread() || !mem_any(t->mem, t->L.size)) return 0;   // the upload batch belongs to the submit thread
+@@ -11460,8 +11467,15 @@ static void present_pipeline(MTLPixelFormat format) {
  // The rectangle of the canvas (dw x dh) the picture (cw x ch) is drawn into: the picture's aspect ratio kept and centred, black bars in the rest (no stretching when the screen's ratio
  // differs from the game's, e.g. iPhone about 19.5:9 against the game's 16:9); when the ratios differ by under 1 % (the remainder from a game width that is a multiple of 8 in the
  // full-screen setup, e.g. 1952x900 against 2868x1320 differs by 0.17 %) the whole canvas, leaving no border of a few pixels
@@ -65,7 +86,7 @@ index 86b8eff..0ace619 100644
      MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
      if (fabs((dw / dh) / (cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
      return vp;
-@@ -11487,6 +11498,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
+@@ -11487,6 +11501,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
      double dw = dst.width, dh = dst.height;
      MTLViewport vp = present_viewport(cw, ch, dw, dh);
@@ -74,7 +95,7 @@ index 86b8eff..0ace619 100644
      int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
      static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
      if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
-@@ -11579,6 +11592,8 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+@@ -11579,6 +11595,8 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
      present_pipeline(dst.pixelFormat);
      double dw = dst.width, dh = dst.height;
      MTLViewport vp = present_viewport(r[2], r[3], dw, dh);

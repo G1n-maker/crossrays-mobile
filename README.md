@@ -72,12 +72,16 @@ On top of [nxnative](https://github.com/seedds/nxnative), for this one game:
 |---|---|---|---|
 | 1 | crash at `main+0x5cc508`, a write through null | `AllocateMemoryBlock` returned 0: `nninitStartup` sizes its heap as `pool − used`, and the host's 64 MB figure is below this game's 120 MB of modules | any game whose modules exceed 64 MB and that uses `SetHeapSize` |
 | 2 | crash at `sdk+0x62a78`, a synthesized handle used as a pointer | `nn::fs::ReadFile`'s `ReadOption` overload without a byte count had no host hook, so the call fell through to the SDK's own implementation | any SDK 9+ game that imports that signature |
-| 3 | **black screen with text only** | `NVN_TEXTURE_FLAGS_COMPRESSIBLE` (0x8) made `tex_init_fill` skip every texture upload | ★ **any game that sets that flag on all its textures and writes them through `SetStorage`** |
+| 3 | **black screen with text only**, then an overlay missing its panel | `NVN_TEXTURE_FLAGS_COMPRESSIBLE` (0x8) excluded such a texture on **two** paths: `tex_init_fill` (its content at creation) and `ft_add` (the CPU-write tracking after creation). The tutorial overlay's panel is created as zeros and written a frame later, so the second path is what kept it out | ★ **any game that sets that flag on all its textures** |
 
 The third is a general bug, not a Cross Rays quirk: the flag is a Switch memory-compression hint,
-not a data format, and in a pool the CPU writes the texels are plain. The first two are with upstream:
+not a data format, and in a pool the CPU writes the texels are plain. Its two symptoms are worth
+knowing apart: `tex_init_fill` left the whole screen black but for text (`first uploads 0`), while
+`ft_add` left only dynamically generated UI panels blank (`write-protection faults 0`).
 
-- [seedds/nxnative#946](https://github.com/seedds/nxnative/pull/946) — the `COMPRESSIBLE` fill condition
+The first two are with upstream:
+
+- [seedds/nxnative#946](https://github.com/seedds/nxnative/pull/946) — both `COMPRESSIBLE` paths
 - [seedds/nxnative#947](https://github.com/seedds/nxnative/pull/947) — the missing `ReadFile` overload
 
 ### The two quality-of-life changes
