@@ -1,10 +1,14 @@
-# SD Gundam G Generation Cross Rays — iOS 移植
+# SD Gundam G Generation Cross Rays — native iOS / macOS port
 
-把 Switch 版《SD高达G世纪：火线纵横》Platinum Edition（含 31 个 DLC）移植到 iPhone / iPad / Mac。
-**不是模拟器**：游戏自己的 ARM64 代码直接在 Apple 芯片上运行，只有 Apple 内核跑不了的指令被重写，
-Horizon 系统服务由 Host 顶替，NVN 图形 API 重建在 Metal 上。
+The Switch release of *SD Gundam G Generation Cross Rays* Platinum Edition (31 DLC included) running
+natively on iPhone, iPad and Apple silicon Macs. **Not an emulator**: the game's own arm64 program
+executes directly on the Apple chip, only the handful of instructions Apple's kernel cannot run are
+rewritten, Horizon's system services are replaced by a host written for Apple platforms, and NVN is
+rebuilt on Metal.
 
-**自带游戏文件**（Bring your own game）：这个仓库不含任何游戏内容。
+**Bring your own game files.** Nothing from any game is in this repository.
+
+中文: [README.zh-CN.md](README.zh-CN.md)
 
 <p align="center">
   <img src="docs/images/title.jpg" width="100%" alt="The title screen: two Gundams clashing, fully rendered">
@@ -12,140 +16,157 @@ Horizon 系统服务由 Host 顶替，NVN 图形 API 重建在 Metal 上。
 
 ---
 
-## 状态
+## Status
 
-| 平台 | 状态 |
+| Platform | |
 |---|---|
-| **iPhone 16 Pro**（A18 Pro，iOS 27） | ✅ 已验收 |
-| **Mac**（Apple Silicon） | ✅ 已验收 |
-| 游戏版本 | 1.6.3（v720896）+ 31 DLC |
+| iPhone 16 Pro (A18 Pro, iOS 27.2) | ✅ played and accepted |
+| Mac (Apple silicon, macOS 27.2) | ✅ played and accepted |
+| Game version | 1.6.3 (v720896) + 31 DLC |
 
-- 60 fps，零丢帧
-- 内存 footprint：Mac ~1.8 GB / iPhone ~1.3 GB
-- 画面完整（标题、菜单、战斗、贴图、特效）
-- 音频正常
-- 触屏操作含完整按键布局，可全屏
+- 60 fps, no dropped frames (frame time p50 16.66 ms, p95 16.79 ms)
+- Memory footprint: about 1.8 GB on the Mac, 1.3 GB on the phone
+- Every screen drawn correctly: title, menus, battles, textures, effects
+- Audio works
+- Touch controls with the full button set, and the picture can fill the screen
 
 ---
 
-## 怎么玩
+## Playing
 
 ```bash
-# 1. 准备（一次性）
-#    - 你的 prod.keys（自己 dump 的）
-#    - Xcode 27.2 + MetalToolchain
-#    - 游戏文件（XCI 或 NSP 文件夹）
+# Once:
+#   - your own prod.keys
+#   - Xcode 27.2 with `xcodebuild -downloadComponent MetalToolchain`
+#   - the game, as an .xci or a folder of .nsp files
 
-# 2. Survey（可选，45 秒）
+# Survey the title (optional, 45 s)
 ./run_nxnative.sh Game -k keys/prod.keys --survey-only
 
-# 3. Mac 上跑
+# Run it on the Mac
 ./run_nxnative.sh Game -k keys/prod.keys --platform mac
 ./play.sh
 
-# 4. 打包 iOS
+# Build an iPhone app (game data kept out of the app: 20 GB does not sideload)
 ./run_nxnative.sh Game -k keys/prod.keys --romfs separate --prepare-xcode --team-id <TEAM_ID>
 ```
 
-详细的移植流程见 [docs/PORTING-WORKFLOW.md](docs/PORTING-WORKFLOW.md)。
+The full procedure is [docs/PORTING-WORKFLOW.md](docs/PORTING-WORKFLOW.md).
+
+The Mac's keys are in [docs/MAC-TESTING.md](docs/MAC-TESTING.md): **J** confirms, **K** cancels,
+**WASD** moves, **Q**/**E** are L and R, **Z**/**C** are ZL and ZR, **Return** opens the menu.
 
 ---
 
-## 这个移植做了什么
+## What this port does
 
-在 [nxnative](https://github.com/seedds/nxnative) 的基础上，为这个游戏：
+On top of [nxnative](https://github.com/seedds/nxnative), for this one game:
 
-- 写了完整的 **game profile**（`nxnative/dm/games/010055700CEA8000/`，含 5 张 shader 表）
-- 修了 **3 个启动/画面的硬阻塞**
-- 加了 **2 个体验优化**（全屏、触屏布局）
+- a complete **game profile** (`profile/010055700CEA8000/`: identity, memory, and five shader tables)
+- **three hard blockers** fixed, without which the game does not start or draws nothing
+- **two quality-of-life changes** (full screen, touch-control placement)
 
-### 三个硬阻塞
+### The three blockers
 
-| # | 问题 | 根因 | 影响范围 |
+| # | Symptom | Cause | Reaches |
 |---|---|---|---|
-| 1 | 启动即崩（`main+0x5cc508` 写 null） | `AllocateMemoryBlock` 返回 0——host 报的"已用内存"64 MB 小于模块实际 120 MB | 任何模块 > 64 MB 且用 `SetHeapSize` 的游戏 |
-| 2 | 卡在 `nnMain` 早期（`sdk+0x62a78`） | `nn::fs::ReadFile` 有一个重载没 hook，调用落到 SDK 实现解引用假 handle | 任何 SDK 9+ 且用这个签名的游戏 |
-| 3 | **全黑但有文字** | `NVN_TEXTURE_FLAGS_COMPRESSIBLE`(0x8) 让 `tex_init_fill` 跳过所有纹理上传 | ★ **任何给所有纹理设此标志 + 用 `SetStorage` 写内存的游戏** |
+| 1 | crash at `main+0x5cc508`, a write through null | `AllocateMemoryBlock` returned 0: `nninitStartup` sizes its heap as `pool − used`, and the host's 64 MB figure is below this game's 120 MB of modules | any game whose modules exceed 64 MB and that uses `SetHeapSize` |
+| 2 | crash at `sdk+0x62a78`, a synthesized handle used as a pointer | `nn::fs::ReadFile`'s `ReadOption` overload without a byte count had no host hook, so the call fell through to the SDK's own implementation | any SDK 9+ game that imports that signature |
+| 3 | **black screen with text only** | `NVN_TEXTURE_FLAGS_COMPRESSIBLE` (0x8) made `tex_init_fill` skip every texture upload | ★ **any game that sets that flag on all its textures and writes them through `SetStorage`** |
 
-第 3 条是**通用 bug**，不只修了 Cross Rays。前两条已经作为独立 PR 提给上游：
+The third is a general bug, not a Cross Rays quirk: the flag is a Switch memory-compression hint,
+not a data format, and in a pool the CPU writes the texels are plain. The first two are with upstream:
 
-- [seedds/nxnative#946](https://github.com/seedds/nxnative/pull/946) — `COMPRESSIBLE` 的填充条件
-- [seedds/nxnative#947](https://github.com/seedds/nxnative/pull/947) — `fs::ReadFile` 缺的 ReadOption 重载
+- [seedds/nxnative#946](https://github.com/seedds/nxnative/pull/946) — the `COMPRESSIBLE` fill condition
+- [seedds/nxnative#947](https://github.com/seedds/nxnative/pull/947) — the missing `ReadFile` overload
 
-### 两个体验优化
+### The two quality-of-life changes
 
-- **全屏**：iPhone 屏幕 2.174:1 vs 游戏 1.778:1。找到 iOS 端 `fit_16_9` 把视图约束成 16:9 的问题，加 `present_fill` 支持三种模式（letterbox / crop / stretch）。
-- **触屏肩键贴边**：肩键原本用 `safe`（扣满 `safeAreaInsets`，横屏 59pt），改成 `corner`（只扣 50%），并缩小边距。
+- **Full screen.** The phone's screen is 2.174:1 against the game's 1.778, so a letterboxed picture
+  leaves 239 px of black on each side. The iOS front end pinned the whole game view to 16:9, which is
+  where those bars came from — the drawable was never the screen. `present_fill` now offers
+  `letterbox` (every pixel, bars), `crop` (fill, 9% off the top and bottom, shapes intact) and
+  `stretch` (fill, 22% wider); the launcher shows it as **Screen fill**.
+- **Shoulder keys reach the edge.** They used the full `safeAreaInsets` inset (59 pt in landscape)
+  while the stick and the ABXY diamond used half of it; now both use half.
 
 ---
 
-## shader 环节
+## Shaders
 
-1090 个 GLSLC 输出全部通过三重校验，最终 **639 个唯一 shader**（127 vs + 512 ps）。
+1,090 GLSLC compiler outputs in `main`'s read-only segment, all passing the triple check, give
+**639 unique shaders** (127 vertex, 512 pixel):
 
 ```
-1090 GLSLC → 639 唯一
-           → SPIR-V:  639 ok / 0 failed   (1.3 s)
-           → MSL:     639 ok / 0 failed   (2.1 s)
-           → metallib (macOS): 1273 编译, 0 失败
-           → metallib (iOS):   1272 编译, 0 失败
+1090 GLSLC  →  639 unique
+            →  SPIR-V:            639 ok / 0 failed   (1.3 s)
+            →  MSL:               639 ok / 0 failed   (2.1 s)
+            →  metallib (macOS):  1273 built, 0 failed
+            →  metallib (iOS):    1272 built, 0 failed
 ```
 
-之所以这么干净，是因为这个游戏的结构和 **13 Sentinels: Aegis Rim**（已跑通）高度同构：
-都是 SDK 9-11 + NVN + CRIWARE + **GLSLC 内嵌 main 只读段**。
+That it went through on the first attempt is not luck: the game is structurally the same as
+**13 Sentinels: Aegis Rim**, which already runs, and which paved this exact path — SDK 9–11, NVN,
+CRIWARE, and GLSLC output compiled into `main`'s read-only segment. Finding such a game first is
+worth more than any other check before starting a port.
 
 ---
 
-## 已知限制
+## Known limits
 
-- **120 fps 做不到**：`fps_target` 改的是游戏引擎自己的帧率上限。Cross Rays 是 60 fps 游戏，强设 120 会让游戏跑 2 倍速。
-- 某个教学画面有轻微贴图错位（文字重叠、色块），后续画面正常。未定位。
-- 长时间运行（> 1 小时）的内存稳定性未测。
-- 31 个 DLC 挂载正常，但内容未逐一验证。
+- **120 fps is not possible.** `fps_target` writes the game's own frame-rate cap, not a render rate.
+  Cross Rays is a 60 fps game; forcing 120 would run its physics and timers at double speed.
+- One tutorial screen shows slightly misplaced textures (overlapping text, stray colour blocks);
+  every screen after it is correct. Not diagnosed.
+- Runs longer than an hour, and memory growth over them, are untested.
+- All 31 DLC mount and are reported as owned; their content was not played through.
 
 ---
 
-## 文件结构
+## Layout
 
 ```
 .
-├── README.md                      # 本文件
-├── play.sh                        # Mac 启动脚本
-├── run_nxnative.sh                # 构建包装脚本
+├── README.md / README.zh-CN.md
+├── play.sh                        # run the game on the Mac
+├── run_nxnative.sh                # build wrapper (local toolchain on PATH)
 ├── docs/
-│   ├── PORTING-WORKFLOW.md        # ★ 移植任意 Switch 游戏的标准工作流
-│   ├── CROSSRAYS-NOTES.md         # 本次移植的完整记录（5 个修复的推导过程）
-│   └── MAC-TESTING.md             # 测试方法 + 键位表
-├── profile/
-│   └── 010055700CEA8000/          # ★ 这个游戏的 game profile + 5 张 shader 表
-├── patches/
-│   ├── nxnative-crossrays.patch   # ★ 对 nxnative 的 7 个文件改动（200 行）
-│   └── README.md                  # 每个改动的用途
-└── keys/                          # 你的 prod.keys（不进 git）
+│   ├── PORTING-WORKFLOW.md        # ★ the reusable procedure for any Switch title
+│   ├── CROSSRAYS-NOTES.md         # this port's record: how each fix was found
+│   ├── MAC-TESTING.md             # what to test, and the keyboard map
+│   └── images/title.jpg
+├── profile/010055700CEA8000/      # ★ the game profile and its five shader tables
+└── patches/
+    ├── nxnative-crossrays.patch   # ★ 7 files, 46 insertions, 11 deletions
+    └── README.md                  # what each hunk is for
 ```
 
-## 怎么用
+## Building from this repository
 
 ```bash
-# 1. 取 nxnative
+# 1. nxnative, and our changes on top
 git clone https://github.com/seedds/nxnative.git
 cd nxnative && git apply ../patches/nxnative-crossrays.patch
 
-# 2. 放入 profile
+# 2. the game profile
 cp -R ../profile/010055700CEA8000 dm/games/
 
-# 3. 准备游戏文件（你自己的 XCI/NSP）+ prod.keys，然后
+# 3. your game files and prod.keys, then
 cd ..
-./run_nxnative.sh Game -k keys/prod.keys --platform mac    # Mac 上跑
-./run_nxnative.sh Game -k keys/prod.keys --romfs separate  # 打 iOS 包
+./run_nxnative.sh Game -k keys/prod.keys --platform mac     # play on the Mac
+./run_nxnative.sh Game -k keys/prod.keys --romfs separate   # build for the iPhone
 ```
 
-完整的移植流程见 [docs/PORTING-WORKFLOW.md](docs/PORTING-WORKFLOW.md)。
+Two things that cost hours to learn and are written down in the workflow doc: clear
+`xcode-build/…/xcode-derived-data` before archiving (an archive can otherwise carry the previous
+binary), and push the 20 GB RomFS image with Finder rather than `devicectl`, which truncates past
+about 10 GB and leaves an image the app rejects with `EINVAL`.
 
 ---
 
-## 许可
+## License
 
-MIT。第三方代码保留各自许可（见 `nxnative/dm/third_party/`）。
+MIT. Third-party code keeps its own license (`nxnative/dm/third_party/`).
 
-与 Nintendo、Bandai Namco 无关。需要你自己合法拥有的游戏文件和主机密钥。
+Not affiliated with Nintendo, Bandai Namco or TOM CREATE. You need game files and console keys you
+dumped from hardware you own.
